@@ -1,0 +1,6 @@
+# Do not include azure-functions-worker as it may conflict with the Azure Functions platform
+
+azure-functions
+requests==2.18.4
+pymongo==3.11.2
+dnspython==1.16.0

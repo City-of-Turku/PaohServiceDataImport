@@ -1,0 +1,222 @@
+name: A pipeline for testing, building and deploying service data importer function
+
+resources:
+- repo: self
+
+trigger:
+  branches:
+    include:
+    - main
+    - dev
+    - feat-*
+  paths:
+    exclude:
+    - README.md
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  tag: '$(Build.BuildId)'
+  isProd: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+  isTest: $[eq(variables['Build.SourceBranch'], 'refs/heads/dev')]
+
+  azureContainerRegistryTest: tkupaohtestcontainerregistry.azurecr.io
+  azureContainerRegistryProd: tkupaohtuotcontainerregistry.azurecr.io
+  azureSubscriptionEndpointTest: tku-palveluohjain-testi-sc
+  azureSubscriptionEndpointProd: tku-palveluohjain-tuotanto-sc
+  kubernetesServiceConnectionTest: tku-palveluohjain-testi-aks-sc
+  kubernetesServiceConnectionProd: tku-palveluohjain-tuotanto-aks-sc
+  dockerRegistryEndpointTest: tku-palveluohjain-testi-docker-sc
+  dockerRegistryEndpointProd: tku-palveluohjain-tuotanto-docker-sc
+
+  serviceDataImportImage: <COMES FROM KUBE>
+
+stages:
+- stage: Test
+  displayName: Run tests
+  jobs:
+  - job: UnitTests
+    steps:
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.8'
+      inputs:
+        versionSpec: '3.8'
+
+    - script: python3 -m pip install --upgrade pip setuptools wheel
+      displayName: 'Install tools'
+
+    - script: pip install -r ServiceDataImportFunctionApp/requirements.txt
+      displayName: 'Installing requirements'
+
+    - script: python3 -m unittest discover -s test --verbose
+      displayName: 'Run tests'
+
+
+- stage: BuildTest
+  displayName: Build image for test environment
+  condition: and(eq(variables.isTest, true), succeeded())
+  variables:
+    - group: tku-paoh-test-variable-group
+  dependsOn: Test
+  jobs:
+  - job: Build
+    displayName: Build
+    steps:
+
+    - task: Docker@2
+      displayName: Login to ACR
+      inputs:
+        command: login
+        containerRegistry: $(dockerRegistryEndpointTest)
+
+    - task: Docker@2
+      displayName: Build an image
+      inputs:
+        command: build
+        repository: servicedataimportfunction
+        containerRegistry: $(dockerRegistryEndpointTest)
+        buildContext: '$(Build.SourcesDirectory)/ServiceDataImportFunctionApp'
+        dockerfile: '$(Build.SourcesDirectory)/ServiceDataImportFunctionApp/Dockerfile'
+        tags: |
+          $(tag)
+
+    - task: Docker@2
+      displayName: Push image to the container registry
+      inputs:
+        command: push
+        repository: servicedataimportfunction
+        containerRegistry: $(dockerRegistryEndpointTest)
+        tags: |
+          $(tag)
+
+- stage: BuildProd
+  displayName: Build image for prod environment
+  condition: and(eq(variables.isProd, true), succeeded())
+  variables:
+    - group: tku-paoh-tuot-variable-group
+  dependsOn: Test
+  jobs:
+  - job: Build
+    displayName: Build
+    steps:
+
+    - task: Docker@2
+      displayName: Login to ACR
+      inputs:
+        command: login
+        containerRegistry: $(dockerRegistryEndpointProd)
+
+    - task: Docker@2
+      displayName: Build an image
+      inputs:
+        command: build
+        repository: servicedataimportfunction
+        containerRegistry: $(dockerRegistryEndpointProd)
+        buildContext: '$(Build.SourcesDirectory)/ServiceDataImportFunctionApp'
+        dockerfile: '$(Build.SourcesDirectory)/ServiceDataImportFunctionApp/Dockerfile'
+        tags: |
+          $(tag)
+    - task: Docker@2
+      displayName: Push image to the container registry
+      inputs:
+        command: push
+        repository: servicedataimportfunction
+        containerRegistry: $(dockerRegistryEndpointProd)
+        tags: |
+          $(tag)
+
+- stage: DeployTest
+  condition: and(eq(variables.isTest, true), succeeded())
+  dependsOn: BuildTest
+  displayName: Deploy to test environment to Azure
+  variables:
+    - group: tku-paoh-test-variable-group
+  jobs:
+  - job: Deploy
+    displayName: Deploy
+    steps:
+
+    - task: KubernetesManifest@0
+      displayName: Create ImagePullSecret
+      inputs:
+        action: createSecret
+        namespace: default
+        kubernetesServiceConnection: $(kubernetesServiceConnectionTest)
+        secretName: imagepullsecret
+        dockerRegistryEndpoint: $(dockerRegistryEndpointTest)
+
+    - task: replacetokens@3
+      displayName: 'Replace tokens in .yaml files'
+      inputs:
+        targetFiles: |
+         $(Build.SourcesDirectory)/kube/service-data-import-function-deployment.yaml
+         $(Build.SourcesDirectory)/kube/service-data-import-function-scaledobject.yaml
+        verbosity: detailed
+        tokenPrefix: '__'
+        tokenSuffix: '__'
+        
+    - task: KubernetesManifest@0
+      displayName: Deploy to Kubernetes test environment cluster
+      inputs:
+        action: deploy
+        namespace: default
+        kubernetesServiceConnection: $(kubernetesServiceConnectionTest)
+        manifests: |
+          kube/service-data-import-function-deployment.yaml
+          kube/service-data-import-function-scaledobject.yaml
+        imagePullSecrets: |
+          imagepullsecret
+        containers: |
+          $(azureContainerRegistryTest)/servicedataimportfunction:$(tag)
+
+- stage: DeployProd
+  condition: and(eq(variables.isProd, true), succeeded())
+  dependsOn: BuildProd
+  displayName: Deploy to production environment to Azure
+  variables:
+    - group: tku-paoh-tuot-variable-group
+  jobs:
+  - job: Deploy
+    displayName: Deploy
+    steps: 
+    - task: KubernetesManifest@0
+      displayName: Create ImagePullSecret
+      inputs:
+        action: createSecret
+        namespace: default
+        kubernetesServiceConnection: $(kubernetesServiceConnectionProd)
+        secretName: imagepullsecret
+        dockerRegistryEndpoint: $(dockerRegistryEndpointProd)
+
+    - task: replacetokens@3
+      displayName: 'Replace tokens in .yaml files'
+      inputs:
+        targetFiles: |
+         $(Build.SourcesDirectory)/kube/service-data-import-function-deployment.yaml
+         $(Build.SourcesDirectory)/kube/service-data-import-function-scaledobject.yaml
+        verbosity: detailed
+        tokenPrefix: '__'
+        tokenSuffix: '__'
+        
+    - task: KubernetesManifest@0
+      displayName: Deploy to Kubernetes production environment cluster
+      inputs:
+        action: deploy
+        namespace: default
+        kubernetesServiceConnection: $(kubernetesServiceConnectionProd)
+        manifests: |
+          kube/service-data-import-function-deployment.yaml
+          kube/service-data-import-function-scaledobject.yaml
+        imagePullSecrets: |
+          imagepullsecret
+        containers: |
+          $(azureContainerRegistryProd)/servicedataimportfunction:$(tag)
+
+
+
+
+
+
+
+
